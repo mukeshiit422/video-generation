@@ -19,6 +19,16 @@ import numpy as np
 import soundfile as sf
 from pydub import AudioSegment
 
+# transformers ≥4.46 removed BeamSearchScorer from the public namespace.
+# Coqui TTS imports it as `from transformers import BeamSearchScorer` — shim it back.
+try:
+    import transformers as _tf
+    if not hasattr(_tf, "BeamSearchScorer"):
+        from transformers.generation.beam_search import BeamSearchScorer as _BSS
+        _tf.BeamSearchScorer = _BSS
+except Exception:
+    pass
+
 from modules.script_processor import Segment
 from utils.logger import setup_logger
 
@@ -137,6 +147,20 @@ class TTSEngine:
     def _init_xtts(self):
         # Suppress the interactive CPML license prompt; we agree to non-commercial use
         os.environ.setdefault("COQUI_TOS_AGREED", "1")
+
+        # PyTorch 2.6+ sets weights_only=True by default.
+        # XTTS checkpoints reference many internal Coqui classes; patching torch.load
+        # for this trusted local model is simpler than allowlisting every class.
+        import torch
+        import functools
+        _orig_load = torch.load
+        @functools.wraps(_orig_load)
+        def _patched_load(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return _orig_load(*args, **kwargs)
+        torch.load = _patched_load
+
+
         from TTS.api import TTS
         model_name = self.cfg.get("xtts_v2", {}).get("model_name", "tts_models/multilingual/multi-dataset/xtts_v2")
         logger.info(f"Loading XTTS-v2 model: {model_name}")

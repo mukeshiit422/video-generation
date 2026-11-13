@@ -7,3 +7,8 @@ logs/
 checkpoints/
 training_data/
 models/
+gfpgan/weights/
+*.pth
+*.ckpt
+*.bin
+*.safetensors

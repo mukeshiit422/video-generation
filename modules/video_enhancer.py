@@ -2,8 +2,8 @@
 Video Enhancer – upscales and restores frames to Full HD (1920×1080).
 
 Pipeline:
-  1. Real-ESRGAN  → 4× super-resolution on every frame
-  2. GFPGAN       → face restoration / detail recovery
+  1. Real-ESRGAN  → 2× super-resolution on every frame
+  2. GFPGAN       → face restoration (skipped when no face in source)
   3. FFmpeg       → re-encode at target resolution
 """
 import os
@@ -22,6 +22,20 @@ logger = setup_logger(__name__)
 ROOT = Path(__file__).parent.parent
 
 
+def _has_face(image_path: str) -> bool:
+    """Quick check: does the source image contain a human face?"""
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            return False
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        faces = cascade.detectMultiScale(gray, 1.1, 3, minSize=(20, 20))
+        return len(faces) > 0
+    except Exception:
+        return False
+
+
 class VideoEnhancer:
     def __init__(self, cfg: dict, device: str = "cpu"):
         self.cfg = cfg.get("video_enhancement", {})
@@ -36,17 +50,46 @@ class VideoEnhancer:
         self,
         video_path: str,
         output_path: str = "outputs/temp_enhanced.mp4",
+        source_image: str = None,
     ) -> str:
         """Enhance video to Full HD. Returns output path."""
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
+        # Fast path: if input is already at or near target resolution, just re-encode
+        import subprocess as _sp2
+        _probe = _sp2.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True,
+        )
+        _dims = _probe.stdout.strip().split()
+        in_w = int(_dims[0]) if len(_dims) > 0 else 0
+        in_h = int(_dims[1]) if len(_dims) > 1 else 0
+        if in_w >= self.target_w * 0.9 and in_h >= self.target_h * 0.9:
+            logger.info(f"Input already {in_w}x{in_h} — skipping ESRGAN/GFPGAN, re-encoding only")
+            import subprocess as _sp
+            _sp.run([
+                "ffmpeg", "-y", "-i", video_path,
+                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                "-pix_fmt", "yuv420p", output_path,
+            ], check=True, capture_output=True)
+            return output_path
+
         pipeline = self.cfg.get("pipeline", ["realesrgan", "gfpgan"])
 
-        # Extract frames
+        # Decide upfront whether GFPGAN is worth running (needs a face)
+        run_gfpgan = "gfpgan" in pipeline
+        if run_gfpgan and source_image:
+            run_gfpgan = _has_face(source_image)
+            if not run_gfpgan:
+                logger.info("No face in source image — skipping GFPGAN for speed")
+
+        # Extract frames as JPEG (much faster I/O than PNG)
         frames_dir = Path(tempfile.mkdtemp(prefix="enhance_frames_"))
         fps = self._extract_frames(video_path, frames_dir)
 
-        frame_paths = sorted(frames_dir.glob("frame_*.png"))
+        frame_paths = sorted(frames_dir.glob("frame_*.jpg"))
         logger.info(f"Enhancing {len(frame_paths)} frames with pipeline: {pipeline}")
 
         enhanced_dir = Path(tempfile.mkdtemp(prefix="enhanced_frames_"))
@@ -59,16 +102,17 @@ class VideoEnhancer:
             if "realesrgan" in pipeline:
                 frame = self._apply_realesrgan(frame)
 
-            if "gfpgan" in pipeline:
+            if run_gfpgan:
                 frame = self._apply_gfpgan(frame)
 
             # Resize to exact target resolution
             frame = self._resize_to_target(frame)
 
-            out_path = enhanced_dir / f"frame_{i:06d}.png"
-            cv2.imwrite(str(out_path), frame)
+            # Write as JPEG for speed; FFmpeg reads them fine
+            out_path = enhanced_dir / f"frame_{i:06d}.jpg"
+            cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-            if (i + 1) % 25 == 0:
+            if (i + 1) % 50 == 0:
                 logger.debug(f"  Enhanced {i+1}/{len(frame_paths)} frames")
 
         # Re-encode to video (no audio – audio is merged in VideoComposer)
@@ -92,7 +136,8 @@ class VideoEnhancer:
             ret, frame = cap.read()
             if not ret:
                 break
-            cv2.imwrite(str(out_dir / f"frame_{idx:06d}.png"), frame)
+            # JPEG quality 95: ~10× smaller than PNG, negligible quality loss
+            cv2.imwrite(str(out_dir / f"frame_{idx:06d}.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
             idx += 1
         cap.release()
         logger.debug(f"Extracted {idx} frames at {fps:.1f} fps")
@@ -104,30 +149,41 @@ class VideoEnhancer:
         if self._realesrgan is not None:
             return
 
-        model_path = ROOT / "models" / "realesrgan" / "RealESRGAN_x4plus.pth"
         cfg = self.cfg.get("realesrgan", {})
+
+        # Prefer lighter x2plus model (faster); fall back to x4plus at outscale=2
+        x2_path = ROOT / "models" / "realesrgan" / "RealESRGAN_x2plus.pth"
+        x4_path = ROOT / "models" / "realesrgan" / "RealESRGAN_x4plus.pth"
+        if x2_path.exists():
+            model_path, scale = x2_path, 2
+        elif x4_path.exists():
+            model_path, scale = x4_path, 4
+        else:
+            logger.warning("No Real-ESRGAN weights found. Upscaling via bicubic.")
+            self._realesrgan = None
+            return
 
         try:
             from basicsr.archs.rrdbnet_arch import RRDBNet
             from realesrgan import RealESRGANer
 
+            nb = 23 if scale == 4 else 23  # x2plus also uses 23 blocks
             model = RRDBNet(
                 num_in_ch=3, num_out_ch=3,
-                num_feat=64, num_block=23, num_grow_ch=32, scale=4
+                num_feat=64, num_block=nb, num_grow_ch=32, scale=scale,
             )
             dev = self.device
-
             self._realesrgan = RealESRGANer(
-                scale=4,
+                scale=scale,
                 model_path=str(model_path),
                 model=model,
-                tile=cfg.get("tile", 512),
+                tile=cfg.get("tile", 256),   # smaller tile = less VRAM, faster on MPS
                 tile_pad=cfg.get("tile_pad", 10),
                 pre_pad=cfg.get("pre_pad", 0),
                 half=(dev != "cpu"),
                 device=dev,
             )
-            logger.info("Real-ESRGAN loaded")
+            logger.info(f"Real-ESRGAN {scale}x loaded from {model_path.name}")
         except Exception as e:
             logger.warning(f"Real-ESRGAN load failed: {e}. Upscaling via bicubic.")
             self._realesrgan = None
@@ -135,11 +191,11 @@ class VideoEnhancer:
     def _apply_realesrgan(self, frame: np.ndarray) -> np.ndarray:
         self._load_realesrgan()
         if self._realesrgan is None:
-            # Fallback: bicubic 2×
             h, w = frame.shape[:2]
             return cv2.resize(frame, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
         try:
-            out, _ = self._realesrgan.enhance(frame, outscale=4)
+            # outscale matches model scale (2 or 4 depending on which weights exist)
+            out, _ = self._realesrgan.enhance(frame, outscale=self._realesrgan.scale)
             return out
         except Exception as e:
             logger.warning(f"ESRGAN frame failed: {e}")
@@ -165,7 +221,6 @@ class VideoEnhancer:
                 channel_multiplier=cfg.get("channel_multiplier", 2),
                 bg_upsampler=None,
                 device=dev,
-                model_rootpath=str(model_path.parent),
             )
             logger.info("GFPGAN loaded")
         except Exception as e:
@@ -190,28 +245,34 @@ class VideoEnhancer:
 
     def _resize_to_target(self, frame: np.ndarray) -> np.ndarray:
         h, w = frame.shape[:2]
-        # Fit inside target, maintaining aspect ratio, then pad
-        ratio = min(self.target_w / w, self.target_h / h)
-        new_w, new_h = int(w * ratio), int(h * ratio)
-        resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        src_ratio = w / h
+        tgt_ratio = self.target_w / self.target_h
 
-        canvas = np.zeros((self.target_h, self.target_w, 3), dtype=np.uint8)
-        y_off = (self.target_h - new_h) // 2
-        x_off = (self.target_w - new_w) // 2
-        canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
-        return canvas
+        if src_ratio >= tgt_ratio:
+            # Wide or square → scale to target height, crop width
+            scale = self.target_h / h
+            new_w, new_h = int(w * scale), self.target_h
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+            x_off = (new_w - self.target_w) // 2
+            return resized[:, x_off:x_off + self.target_w]
+        else:
+            # Portrait → scale to target width, crop height
+            scale = self.target_w / w
+            new_w, new_h = self.target_w, int(h * scale)
+            resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+            y_off = (new_h - self.target_h) // 2
+            return resized[y_off:y_off + self.target_h, :]
 
     def _frames_to_video(self, frames_dir: Path, output_path: str, fps: float):
         import subprocess
-        frame_pattern = str(frames_dir / "frame_%06d.png")
+        frame_pattern = str(frames_dir / "frame_%06d.jpg")
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
             "-i", frame_pattern,
-            "-vf", f"scale={self.target_w}:{self.target_h}",
             "-c:v", "libx264",
-            "-preset", "slow",
-            "-crf", "18",
+            "-preset", "medium",
+            "-crf", "20",
             "-pix_fmt", "yuv420p",
             output_path,
         ]

@@ -52,6 +52,47 @@ class FaceAnimator:
         self.cfg = cfg.get("face_animation", {})
         self.device = device
         self.backend = self.cfg.get("backend", "sadtalker")
+        self._sadtalker_disabled = False  # set True after first failure; skip for rest of job
+
+    def _assert_face_detected(self, image_path: str):
+        """
+        Raise ValueError if no high-confidence frontal face is found.
+        Uses stricter thresholds than a basic Haar check so we avoid calling
+        SadTalker on images its internal landmark detector will reject.
+        """
+        try:
+            import cv2
+            img = cv2.imread(image_path)
+            if img is None:
+                raise ValueError("Could not read image file")
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # Strict params: minNeighbors=5 reduces false positives (cartoons, etc.)
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            detector = cv2.CascadeClassifier(cascade_path)
+            faces = detector.detectMultiScale(
+                gray, scaleFactor=1.05, minNeighbors=5, minSize=(60, 60)
+            )
+            if len(faces) == 0:
+                raise ValueError(
+                    "No high-confidence frontal face detected — routing to FOMM. "
+                    "SadTalker requires a photo with a clearly visible, forward-facing human face."
+                )
+
+            # Additional check: face must cover at least 5% of the image area
+            h, w = gray.shape
+            img_area = h * w
+            largest_face_area = max(fw * fh for (_, _, fw, fh) in faces)
+            if largest_face_area < img_area * 0.05:
+                raise ValueError(
+                    f"Detected face is too small ({largest_face_area/img_area:.1%} of image) — routing to FOMM."
+                )
+
+            logger.info(f"Face pre-check passed — {len(faces)} face(s) detected")
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.warning(f"Face pre-check skipped: {e}")
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -62,22 +103,24 @@ class FaceAnimator:
         output_path: str = "outputs/temp_raw.mp4",
         progress_cb=None,
     ) -> str:
-        """Animate character image with audio. progress_cb(done, total) called with frame counts."""
+        """Animate character image with audio. Auto-falls back to FOMM for non-human images."""
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-        if self.backend == "sadtalker" and SADTALKER_DIR.exists():
-            return self._animate_sadtalker(image_path, audio_path, output_path, progress_cb)
-        elif self.backend == "wav2lip" and WAV2LIP_DIR.exists():
-            return self._animate_wav2lip(image_path, audio_path, output_path)
-        else:
-            if SADTALKER_DIR.exists():
+        # Try SadTalker first; fall back to FOMM on face-check failure or subprocess error.
+        # Once SadTalker fails once, _sadtalker_disabled is set so subsequent images in the
+        # same job skip the attempt entirely.
+        if SADTALKER_DIR.exists() and not self._sadtalker_disabled:
+            try:
+                self._assert_face_detected(image_path)
                 return self._animate_sadtalker(image_path, audio_path, output_path, progress_cb)
-            elif WAV2LIP_DIR.exists():
-                return self._animate_wav2lip(image_path, audio_path, output_path)
-            else:
-                raise RuntimeError(
-                    "No face animation backend found. Run install.sh to clone SadTalker."
-                )
+            except (ValueError, RuntimeError) as e:
+                logger.warning(f"SadTalker skipped ({e}). Falling back to FOMM.")
+                self._sadtalker_disabled = True
+
+        if self.backend == "wav2lip" and WAV2LIP_DIR.exists():
+            return self._animate_wav2lip(image_path, audio_path, output_path)
+
+        return self._animate_fomm(image_path, audio_path, output_path)
 
     # ── SadTalker ─────────────────────────────────────────────────────────────
 
@@ -91,6 +134,9 @@ class FaceAnimator:
         """Call SadTalker inference script via subprocess."""
         st_cfg = self.cfg.get("sadtalker", {})
         checkpoints_dir = str(ROOT / "models" / "sadtalker" / "checkpoints")
+
+        # Validate face is detectable before invoking SadTalker
+        self._assert_face_detected(image_path)
 
         # Pre-process the image so SadTalker always receives a clean 512-px RGB PNG
         result_dir = str(ROOT / "outputs" / "sadtalker_tmp")
@@ -156,7 +202,11 @@ class FaceAnimator:
 
         proc.wait()
         if proc.returncode != 0:
-            raise RuntimeError(f"SadTalker failed with return code {proc.returncode}")
+            raise RuntimeError(
+                "SadTalker failed — most likely cause: no frontal face detected in the image. "
+                "Use a photo where the face is clearly visible and roughly facing the camera. "
+                f"(return code {proc.returncode})"
+            )
 
         # Find generated video
         generated = list(Path(result_dir).glob("**/*.mp4"))
@@ -171,6 +221,123 @@ class FaceAnimator:
         clear_gpu_cache()
         logger.info(f"SadTalker output → {output_path}")
         return output_path
+
+    # ── Ken Burns (slow zoom/pan) — best for scene illustrations, cartoons ──────
+
+    # Four distinct motion styles — rotated per image so each segment looks different
+    _KB_MOTIONS = [
+        # slow zoom in from center
+        "z='min(zoom+0.0003,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+        # slow zoom out from center
+        "z='if(eq(on,1),1.12,max(zoom-0.0003,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+        # zoom in anchored to bottom-left (characters often bottom-centre)
+        "z='min(zoom+0.0003,1.12)':x='iw*(1-1/zoom)*0.3':y='ih*(1-1/zoom)'",
+        # zoom in anchored to top-right
+        "z='min(zoom+0.0003,1.12)':x='iw*(1-1/zoom)':y='0'",
+    ]
+
+    def _animate_ken_burns(
+        self,
+        image_path: str,
+        audio_path: str,
+        output_path: str,
+        motion_idx: int = 0,
+    ) -> str:
+        """
+        Ken Burns slow-zoom/pan effect for the full duration of audio_path.
+        Far better than FOMM for scene illustrations — no warping artifacts.
+        Runs entirely via FFmpeg (fast, no ML).
+        """
+        # Get audio duration
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            capture_output=True, text=True,
+        )
+        duration = float(probe.stdout.strip() or "5")
+        fps = 25
+        n_frames = max(1, int(duration * fps))
+
+        motion = self._KB_MOTIONS[motion_idx % len(self._KB_MOTIONS)]
+
+        # Scale source to 2160×2160 so zoompan has room to work at any aspect ratio.
+        # The zoompan s=WxH crops out 1920×1080, covering the image crop-fill style.
+        vf = (
+            "scale=2160:2160:flags=lanczos:force_original_aspect_ratio=increase,"
+            f"crop=2160:2160,"
+            f"zoompan={motion}:d={n_frames}:fps={fps}:s=1920x1080"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", image_path,
+            "-i", audio_path,
+            "-filter_complex", f"[0:v]{vf}[v]",
+            "-map", "[v]", "-map", "1:a",
+            "-t", str(duration),
+            "-c:v", "libx264", "-c:a", "aac",
+            "-preset", "fast", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Ken Burns FFmpeg failed:\n{result.stderr[-600:]}")
+        logger.info(f"Ken Burns ({motion_idx % len(self._KB_MOTIONS)}) → {output_path}")
+        return output_path
+
+    def animate_bulk_ken_burns(self, image_audio_pairs: list) -> list:
+        """
+        Animate each image: tries SVD (actual motion) first, falls back to Ken Burns.
+        image_audio_pairs: [(image_path, audio_path, output_path), ...]
+        """
+        # Lazy-init SVD animator once for the whole batch
+        svd = self._get_svd_animator()
+
+        output_paths = []
+        for idx, (img, audio, out) in enumerate(image_audio_pairs):
+            if svd is not None:
+                try:
+                    logger.info(f"SVD animating image {idx+1}/{len(image_audio_pairs)}…")
+                    svd.animate(img, audio, out)
+                    output_paths.append(out)
+                    continue
+                except Exception as e:
+                    logger.warning(f"SVD failed for image {idx}: {e} — falling back to Ken Burns")
+
+            # Ken Burns fallback
+            self._animate_ken_burns(img, audio, out, motion_idx=idx)
+            output_paths.append(out)
+            logger.info(f"Ken Burns done [{idx+1}/{len(image_audio_pairs)}]")
+        return output_paths
+
+    def _get_svd_animator(self):
+        """Return a loaded SVDAnimator, or None if SVD is unavailable."""
+        if hasattr(self, "_svd"):
+            return self._svd
+        try:
+            from modules.video_animator import SVDAnimator
+            self._svd = SVDAnimator(device=self.device)
+            self._svd._load()   # pre-load model once for the batch
+            return self._svd
+        except Exception as e:
+            logger.warning(f"SVD unavailable ({e}) — will use Ken Burns")
+            self._svd = None
+            return None
+
+    # Keep animate_bulk_fomm as an alias so old call sites don't break
+    def animate_bulk_fomm(self, image_audio_pairs: list, output_dir: str = "") -> list:
+        return self.animate_bulk_ken_burns(image_audio_pairs)
+
+    def _animate_fomm(self, image_path: str, audio_path: str, output_path: str) -> str:
+        """Single-image: try SVD, fall back to Ken Burns."""
+        svd = self._get_svd_animator()
+        if svd is not None:
+            try:
+                return svd.animate(image_path, audio_path, output_path)
+            except Exception as e:
+                logger.warning(f"SVD failed: {e} — Ken Burns fallback")
+        return self._animate_ken_burns(image_path, audio_path, output_path)
 
     # ── Wav2Lip ───────────────────────────────────────────────────────────────
 

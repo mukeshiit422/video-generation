@@ -142,7 +142,6 @@ class ImageGenerator:
                 channel_multiplier=2,
                 bg_upsampler=None,
                 device=self.device if self.device != "mps" else "cpu",
-                model_rootpath=str(ROOT / "models" / "gfpgan"),
             )
 
             img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)

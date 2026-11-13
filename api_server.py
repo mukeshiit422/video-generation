@@ -303,12 +303,21 @@ async def _run_generation(
                 "job_started_at": job_started,
             })
 
-        raw_video = await asyncio.to_thread(
-            FaceAnimator(cfg, device=device).animate,
-            char_path, audio_path,
-            str(job_dir / "raw.mp4"),
-            _anim_progress,
-        )
+        animator = FaceAnimator(cfg, device=device)
+        if len(char_paths) == 1:
+            raw_video = await asyncio.to_thread(
+                animator.animate,
+                char_path, audio_path,
+                str(job_dir / "raw.mp4"),
+                _anim_progress,
+            )
+        else:
+            # Multiple images — split audio evenly, animate each, concatenate
+            raw_video = await asyncio.to_thread(
+                _animate_multi_image,
+                animator, char_paths, audio_path,
+                job_dir, _anim_progress,
+            )
 
         if enhance:
             update(4, "Enhancing to Full HD…", 65)
@@ -317,6 +326,7 @@ async def _run_generation(
                 VideoEnhancer(cfg, device=device).enhance,
                 raw_video,
                 str(job_dir / "enhanced.mp4"),
+                char_path,  # pass primary image for face detection
             )
 
         update(5, "Compositing…", 85)
@@ -340,6 +350,83 @@ async def _run_generation(
     except Exception as e:
         jobs[job_id].update({"status": "error", "error": str(e), "message": f"Error: {e}"})
         import traceback; traceback.print_exc()
+
+
+def _animate_multi_image(animator, char_paths, audio_path, job_dir, progress_cb):
+    """Split audio into N equal segments, animate each image, concatenate clips."""
+    import subprocess as _sp
+    from pathlib import Path as _P
+
+    n = len(char_paths)
+
+    # Get total audio duration
+    probe = _sp.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+        capture_output=True, text=True,
+    )
+    total_dur = float(probe.stdout.strip() or "10")
+    seg_dur = total_dur / n
+
+    # Split audio segments
+    seg_audios, clip_paths = [], []
+    for i in range(n):
+        seg_audio = str(job_dir / f"audio_seg_{i}.wav")
+        _sp.run([
+            "ffmpeg", "-y", "-i", audio_path,
+            "-ss", str(i * seg_dur), "-t", str(seg_dur),
+            "-c", "copy", seg_audio,
+        ], check=True, capture_output=True)
+        seg_audios.append(seg_audio)
+        clip_paths.append(str(job_dir / f"raw_seg_{i}.mp4"))
+
+    # Classify images upfront: SadTalker (frontal human face) vs FOMM (everything else)
+    sadtalker_idxs, fomm_idxs = [], []
+    for i, img in enumerate(char_paths):
+        if animator._sadtalker_disabled:
+            fomm_idxs.append(i)
+        else:
+            try:
+                animator._assert_face_detected(img)
+                sadtalker_idxs.append(i)
+            except (ValueError, Exception):
+                fomm_idxs.append(i)
+
+    # Run SadTalker images sequentially; on first failure disable it for the rest
+    for i in sadtalker_idxs:
+        try:
+            animator._animate_sadtalker(char_paths[i], seg_audios[i], clip_paths[i], None)
+        except RuntimeError as e:
+            print(f"[api_server] SadTalker failed for image {i}: {e} — routing to FOMM", flush=True)
+            animator._sadtalker_disabled = True
+            fomm_idxs.append(i)
+
+    # Run ALL FOMM images in ONE subprocess (model loads once for all)
+    if fomm_idxs:
+        pairs = [(char_paths[i], seg_audios[i], clip_paths[i]) for i in sorted(fomm_idxs)]
+        animator.animate_bulk_fomm(pairs, str(job_dir))
+
+    progress_cb(90, 100)
+
+    # Concatenate all clips in original order (use absolute paths for ffmpeg safety)
+    concat_list = str(job_dir / "concat.txt")
+    with open(concat_list, "w") as f:
+        for p in clip_paths:
+            f.write(f"file '{_P(p).resolve()}'\n")
+
+    out = str(job_dir / "raw.mp4")
+    _sp.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", concat_list, "-c", "copy", out,
+    ], check=True, capture_output=True)
+
+    # Cleanup
+    for p in clip_paths:
+        _P(p).unlink(missing_ok=True)
+    for a in seg_audios:
+        _P(a).unlink(missing_ok=True)
+    _P(concat_list).unlink(missing_ok=True)
+    return out
 
 
 async def _run_image_generation(
