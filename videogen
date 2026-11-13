@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Single entry-point – no manual venv activation needed.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$DIR/venv/bin/python" "$DIR/agent.py" "$@"

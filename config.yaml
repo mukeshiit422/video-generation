@@ -1,0 +1,165 @@
+# ── Video Generator Agent Configuration ───────────────────────────────────────
+
+project:
+  name: "VideoGen Agent"
+  version: "1.0.0"
+  output_dir: "outputs"
+  temp_dir: "outputs/temp"
+  training_data_dir: "training_data"
+  checkpoints_dir: "checkpoints"
+  characters_dir: "characters"
+  scripts_dir: "scripts"
+
+# ── TTS Configuration ─────────────────────────────────────────────────────────
+tts:
+  # Backend priority: xtts_v2 → bark → edge_tts → pyttsx3
+  primary_backend: "xtts_v2"
+  fallback_backends: ["edge_tts", "pyttsx3"]
+
+  xtts_v2:
+    model_name: "tts_models/multilingual/multi-dataset/xtts_v2"
+    language: "en"
+    # Minimum voice sample length in seconds for cloning
+    min_voice_sample_seconds: 3
+    temperature: 0.7
+    top_p: 0.85
+    top_k: 50
+    speed: 1.0
+
+  bark:
+    voice_preset: "v2/en_speaker_6"
+    output_sample_rate: 24000
+
+  edge_tts:
+    voice: "en-US-JennyNeural"
+    rate: "+0%"
+    volume: "+0%"
+
+  audio:
+    sample_rate: 24000
+    # Silence between segments in ms
+    pause_between_segments: 300
+
+# ── Face Animation Configuration ─────────────────────────────────────────────
+face_animation:
+  # Backend: sadtalker | wav2lip | latentsync
+  backend: "sadtalker"
+
+  sadtalker:
+    repo_path: "third_party/SadTalker"
+    # still=True reduces head movement for studio look
+    still_mode: false
+    preprocess: "resize"     # full | crop | resize
+    # pose_style: 0=neutral, 1-45=varied
+    pose_style: 0
+    batch_size: 2
+    expression_scale: 1.0
+    # Use GFPGAN inside SadTalker for initial enhancement
+    enhancer: null           # gfpgan | null (we apply our own enhancer after)
+    output_size: 512
+
+  wav2lip:
+    repo_path: "third_party/Wav2Lip"
+    model_path: "models/wav2lip/wav2lip_gan.pth"
+    resize_factor: 1
+    pads: [0, 10, 0, 0]
+    nosmooth: false
+
+# ── Video Enhancement Configuration ──────────────────────────────────────────
+video_enhancement:
+  enabled: true
+  target_resolution: [1920, 1080]  # Full HD
+
+  realesrgan:
+    model_name: "RealESRGAN_x4plus"      # or RealESRNet_x4plus for faster
+    tile: 512
+    tile_pad: 10
+    pre_pad: 0
+    face_enhance: true
+
+  gfpgan:
+    model_path: "models/gfpgan/GFPGANv1.4.pth"
+    upscale: 2
+    arch: "clean"
+    channel_multiplier: 2
+    bg_upsampler: "realesrgan"
+
+  # Enhancement pipeline order
+  pipeline: ["realesrgan", "gfpgan"]
+
+# ── Video Composition ─────────────────────────────────────────────────────────
+video_composition:
+  fps: 25
+  codec: "libx264"
+  audio_codec: "aac"
+  audio_bitrate: "192k"
+  video_bitrate: "8M"
+  crf: 18                    # 0-51, lower=better quality
+  preset: "medium"           # ultrafast | fast | medium | slow | veryslow
+  pixel_format: "yuv420p"
+  # Crossfade between segments in seconds
+  crossfade_duration: 0.1
+
+# ── Script Processing ─────────────────────────────────────────────────────────
+script_processing:
+  # Maximum characters per TTS segment
+  max_segment_chars: 300
+  # Split on these markers (in addition to sentence boundaries)
+  scene_markers: ["[SCENE]", "[CUT]", "[PAUSE]", "[BREAK]"]
+  # Pause durations in seconds
+  pause_durations:
+    "[PAUSE]": 0.5
+    "[BREAK]": 1.0
+    "[LONG_PAUSE]": 2.0
+
+# ── Training Configuration ────────────────────────────────────────────────────
+training:
+  # Collect training data from every generation
+  auto_collect: true
+  # Minimum user rating to include in training (1-5 stars)
+  min_rating_for_training: 4
+
+  character_finetune:
+    # Epochs for character-specific SadTalker fine-tuning
+    epochs: 100
+    batch_size: 4
+    learning_rate: 0.0001
+    # Augmentation
+    random_flip: true
+    random_rotation: 10
+
+  voice_finetune:
+    # Epochs for XTTS voice fine-tuning
+    epochs: 50
+    batch_size: 8
+    learning_rate: 0.00005
+
+# ── Model Paths ───────────────────────────────────────────────────────────────
+models:
+  sadtalker:
+    checkpoints: "models/sadtalker/checkpoints"
+    gfpgan: "models/sadtalker/gfpgan/weights"
+
+  realesrgan:
+    path: "models/realesrgan"
+
+  gfpgan:
+    path: "models/gfpgan"
+
+  wav2lip:
+    path: "models/wav2lip"
+
+# ── Web Server ────────────────────────────────────────────────────────────────
+server:
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+  workers: 1
+  max_upload_size_mb: 100
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"       # DEBUG | INFO | WARNING | ERROR
+  file: "logs/agent.log"
+  max_bytes: 10485760  # 10 MB
+  backup_count: 5
