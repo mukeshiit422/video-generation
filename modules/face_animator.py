@@ -54,12 +54,48 @@ class FaceAnimator:
         self.backend = self.cfg.get("backend", "sadtalker")
         self._sadtalker_disabled = False  # set True after first failure; skip for rest of job
 
+    def _retinaface_count(self, image_path: str) -> int:
+        """Count faces the way SadTalker's preprocess does (same model, threshold, input)."""
+        import torch
+        from PIL import Image
+        from facexlib.detection import init_detection_model
+
+        if getattr(self, "_retinaface", None) is None:
+            # CPU: SadTalker runs on CPU too, and this is a single small image
+            self._retinaface = init_detection_model(
+                "retinaface_resnet50", half=False, device="cpu",
+                model_rootpath=str(ROOT / "models" / "gfpgan"),
+            )
+        img = Image.open(image_path).convert("RGB")
+        img.thumbnail((512, 512))  # SadTalker sees the 512-px preprocessed image
+        with torch.no_grad():
+            bboxes = self._retinaface.detect_faces(img, 0.97)
+        return len(bboxes)
+
     def _assert_face_detected(self, image_path: str):
         """
         Raise ValueError if no high-confidence frontal face is found.
         Uses stricter thresholds than a basic Haar check so we avoid calling
         SadTalker on images its internal landmark detector will reject.
         """
+        # Primary check: the exact detector + threshold SadTalker itself uses
+        # (facexlib RetinaFace, conf 0.97, PIL RGB input). Haar cascades produce
+        # false positives on cartoons/animals (found "5 faces" in a cartoon fox),
+        # which launched SadTalker only for it to crash with IndexError.
+        try:
+            n_faces = self._retinaface_count(image_path)
+        except Exception as e:
+            logger.warning(f"RetinaFace pre-check unavailable ({e}); using Haar cascade")
+            n_faces = None
+        if n_faces is not None:
+            if n_faces == 0:
+                raise ValueError(
+                    "No human face found (RetinaFace) — SadTalker needs a clearly visible, "
+                    "forward-facing human face. Using pan/zoom animation instead."
+                )
+            logger.info(f"Face pre-check passed — {n_faces} face(s) detected (RetinaFace)")
+            return
+
         try:
             import cv2
             img = cv2.imread(image_path)
@@ -176,6 +212,9 @@ class FaceAnimator:
         if self.device == "mps":
             env["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
         env["PYTHONUNBUFFERED"] = "1"  # ensure subprocess stdout is not buffered
+        # Face detection/alignment weights (patched in by patch_dependencies.py).
+        # Must not be a gfpgan/ dir under SADTALKER_DIR — that shadows the gfpgan package.
+        env["SADTALKER_FACEXLIB_DIR"] = str(ROOT / "models" / "gfpgan")
 
         logger.info(f"Running SadTalker: {' '.join(cmd[-6:])}")
 
@@ -315,6 +354,18 @@ class FaceAnimator:
         """Return a loaded SVDAnimator, or None if SVD is unavailable."""
         if hasattr(self, "_svd"):
             return self._svd
+        # SVD-XT is ~10 GB of weights and needs far more RAM to run. On small
+        # machines it pushes the system into heavy swap (observed: 14 GB swap on
+        # an 8 GB M2, job never finishing), so go straight to Ken Burns.
+        min_ram_gb = self.cfg.get("svd", {}).get("min_ram_gb", 16)
+        try:
+            ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024**3
+        except (ValueError, OSError, AttributeError):
+            ram_gb = 0
+        if ram_gb < min_ram_gb:
+            logger.info(f"SVD skipped: {ram_gb:.0f} GB RAM < {min_ram_gb} GB (svd.min_ram_gb) — using Ken Burns")
+            self._svd = None
+            return None
         try:
             from modules.video_animator import SVDAnimator
             self._svd = SVDAnimator(device=self.device)

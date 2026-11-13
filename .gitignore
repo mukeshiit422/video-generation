@@ -16,3 +16,4 @@ gfpgan/
 
 # Repos cloned by install.sh
 third_party/*/
+.DS_Store

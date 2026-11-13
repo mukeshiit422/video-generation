@@ -46,6 +46,14 @@ REPLACEMENTS = [
         r"model_rootpath='gfpgan/weights'\)",
         "model_rootpath=os.path.join(ROOT_DIR, 'gfpgan/weights'))",
     ),
+    # SadTalker loads facexlib weights from a cwd-relative 'gfpgan/weights'. Any gfpgan/
+    # dir in its cwd (third_party/SadTalker) shadows the gfpgan package and SadTalker dies
+    # on import. Read the location from an env var instead (face_animator sets it to
+    # models/gfpgan/), so no gfpgan/ directory is ever needed.
+    (
+        r"root_path = 'gfpgan/weights'",
+        "root_path = os.environ.get('SADTALKER_FACEXLIB_DIR', 'gfpgan/weights')",
+    ),
     # torchvision 0.13+ deprecated pretrained=False (facexlib retinaface); weights=None is identical
     (r'models\.resnet50\(pretrained=False\)', 'models.resnet50(weights=None)'),
     # Also replace the old np.stack form if it survived a previous patch run

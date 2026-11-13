@@ -36,6 +36,31 @@ logger = setup_logger(__name__)
 
 ROOT = Path(__file__).parent.parent
 
+# Curated Edge-TTS neural voices offered in the UI (all verified against
+# edge_tts.list_voices()). "Multilingual" voices can also read Hindi/other text.
+VOICES = [
+    # id                                  label                         gender    group
+    ("en-IN-NeerjaNeural",            "Neerja – warm, friendly",        "female", "English (India)"),
+    ("en-IN-NeerjaExpressiveNeural",  "Neerja Expressive – lively",     "female", "English (India)"),
+    ("en-IN-PrabhatNeural",           "Prabhat – friendly",             "male",   "English (India)"),
+    ("hi-IN-SwaraNeural",             "Swara – friendly",               "female", "Hindi"),
+    ("hi-IN-MadhurNeural",            "Madhur – friendly",              "male",   "Hindi"),
+    ("en-US-AvaMultilingualNeural",   "Ava – expressive, caring",       "female", "English (US)"),
+    ("en-US-EmmaMultilingualNeural",  "Emma – cheerful, clear",         "female", "English (US)"),
+    ("en-US-JennyNeural",             "Jenny – friendly",               "female", "English (US)"),
+    ("en-US-AriaNeural",              "Aria – confident",               "female", "English (US)"),
+    ("en-US-AndrewMultilingualNeural","Andrew – warm, confident",       "male",   "English (US)"),
+    ("en-US-BrianMultilingualNeural", "Brian – casual, approachable",   "male",   "English (US)"),
+    ("en-US-GuyNeural",               "Guy – energetic",                "male",   "English (US)"),
+    ("en-US-ChristopherNeural",       "Christopher – authoritative",    "male",   "English (US)"),
+    ("en-GB-SoniaNeural",             "Sonia – friendly",               "female", "English (UK)"),
+    ("en-GB-LibbyNeural",             "Libby – friendly",               "female", "English (UK)"),
+    ("en-GB-RyanNeural",              "Ryan – friendly",                "male",   "English (UK)"),
+    ("en-AU-NatashaNeural",           "Natasha – friendly",             "female", "English (Australia)"),
+    ("en-US-AnaNeural",               "Ana – child voice (cute)",       "female", "Kids"),
+]
+EDGE_VOICE_RE = re.compile(r"^[a-z]{2,3}-[A-Z]{2}-\w+Neural$")
+
 
 class TTSEngine:
     def __init__(self, cfg: dict, device: str = "cpu"):
@@ -54,19 +79,30 @@ class TTSEngine:
         language: str = "en",
         speaker: str = "default",
         output_path: str = "outputs/temp_audio.wav",
+        rate: str = "+0%",
     ) -> str:
         """Generate a single audio file from all segments.
+
+        speaker: an Edge-TTS voice id (see VOICES) to use that voice directly, or
+                 "default" for the configured backend chain. A voice_sample
+                 (cloning) always takes the backend chain, since only XTTS clones.
+        rate:    speaking speed for Edge-TTS, e.g. "-10%", "+0%", "+15%".
         Falls back to silence if every TTS backend fails."""
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        self._rate = rate
 
-        try:
-            backend = self._load_backend(voice_sample)
-        except RuntimeError as e:
-            logger.warning(f"All TTS backends failed ({e}). Generating silence.")
-            return self._generate_silence(segments, output_path)
+        if EDGE_VOICE_RE.match(speaker or "") and not voice_sample:
+            backend, self._backend_name = self._synth_edge_tts, f"edge_tts ({speaker})"
+        else:
+            try:
+                backend = self._load_backend(voice_sample)
+            except RuntimeError as e:
+                logger.warning(f"All TTS backends failed ({e}). Generating silence.")
+                return self._generate_silence(segments, output_path)
 
         logger.info(f"TTS backend: {self._backend_name}")
         combined = AudioSegment.silent(duration=0)
+        self.failed_segments = 0  # callers can tell "spoke" from "silent fallback"
 
         for seg in segments:
             logger.debug(f"  Synthesising segment {seg.index}: '{seg.text[:60]}…'")
@@ -75,6 +111,7 @@ class TTSEngine:
                 audio = AudioSegment.from_wav(wav_path)
             except Exception as e:
                 logger.warning(f"  Segment {seg.index} failed ({e}), using silence.")
+                self.failed_segments += 1
                 # Estimate duration: ~130 words/min → chars/650 seconds
                 dur_ms = max(1000, int(len(seg.text) / 650 * 60 * 1000))
                 audio = AudioSegment.silent(duration=dur_ms)
@@ -108,11 +145,13 @@ class TTSEngine:
         voice_sample: Optional[str] = None,
         language: str = "en",
         output_path: str = "outputs/temp_audio.wav",
+        speaker: str = "default",
+        rate: str = "+0%",
     ) -> str:
         """Convenience: synthesise raw text string directly."""
         from modules.script_processor import ScriptProcessor, Segment
         segments = [Segment(index=0, text=text)]
-        return self.synthesize(segments, voice_sample, language, output_path=output_path)
+        return self.synthesize(segments, voice_sample, language, speaker, output_path, rate)
 
     # ── Backend Loader ─────────────────────────────────────────────────────────
 
@@ -246,12 +285,15 @@ class TTSEngine:
         }
         if language in lang_voices:
             voice = lang_voices[language]
+        if EDGE_VOICE_RE.match(speaker or ""):
+            voice = speaker  # explicit choice from the UI wins
+        rate = getattr(self, "_rate", None) or self.cfg.get("edge_tts", {}).get("rate", "+0%")
 
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             tmp_mp3 = f.name
 
         async def _run():
-            tts = edge_tts.Communicate(text, voice)
+            tts = edge_tts.Communicate(text, voice, rate=rate)
             await tts.save(tmp_mp3)
 
         asyncio.run(_run())

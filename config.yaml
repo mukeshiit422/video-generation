@@ -168,3 +168,8 @@ logging:
 # Local LLM, loaded per request and unloaded after so it never shares RAM with SD.
 prompt_enhancer:
   model: Qwen/Qwen2.5-1.5B-Instruct
+
+# Stable Video Diffusion (fallback animation for non-face images). Needs lots of RAM;
+# skipped below this threshold in favour of a Ken Burns pan/zoom.
+svd:
+  min_ram_gb: 16

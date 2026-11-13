@@ -11,6 +11,7 @@ so it never sits in memory alongside the Stable Diffusion pipeline.
 import gc
 import json
 import re
+from contextlib import contextmanager
 from typing import Optional
 
 from utils.logger import setup_logger
@@ -97,20 +98,24 @@ class PromptEnhancer:
         cfg = (cfg or {}).get("prompt_enhancer", {})
         self.model_id = cfg.get("model", DEFAULT_MODEL)
 
-    def enhance(self, description: str) -> dict:
-        """Return {"prompt", "negative", "style"} for a plain-language description."""
+    def enhance(self, description: str, context: str = "", style: str = "") -> dict:
+        """Return {"prompt", "negative", "style"} for a plain-language description.
+
+        context: visuals that must stay the same across calls (story scenes).
+        style:   force this style instead of guessing (keeps a story consistent).
+        """
         description = description.strip()
         if not description:
             raise ValueError("Empty description")
 
-        raw = self._generate(description)
+        raw = self._generate(description, context)
         result = self._parse(raw)
         if result is None:
             logger.warning(f"Enhancer returned unparseable output, using cleaned input: {raw[:200]!r}")
             result = {"prompt": _strip_filler(description), "negative": "", "style": ""}
 
         # The user's own words beat a 1.5B model's guess at the style
-        style = _style_from_keywords(description) or result.get("style")
+        style = style or _style_from_keywords(description) or result.get("style")
         if style not in STYLES:
             style = ""
         result["style"] = style
@@ -138,25 +143,49 @@ class PromptEnhancer:
 
     # ── internals ──────────────────────────────────────────────────────────────
 
-    def _generate(self, description: str) -> str:
+    # Model lifecycle: by default each call loads and unloads the LLM (so it never
+    # sits in RAM next to Stable Diffusion). Wrap many calls in `with pe.session():`
+    # to load it once — used by the story planner for N scene prompts.
+
+    @contextmanager
+    def session(self):
+        self._load()
+        try:
+            yield self
+        finally:
+            self._unload()
+
+    def _load(self):
+        if getattr(self, "_model", None) is not None:
+            return
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        device = get_device()
-        dtype = torch.float16 if device in ("mps",) or "cuda" in device else torch.float32
-
+        self._device = get_device()
+        dtype = torch.float16 if self._device == "mps" or "cuda" in self._device else torch.float32
         logger.info(f"Loading prompt enhancer: {self.model_id}")
-        tok = AutoTokenizer.from_pretrained(self.model_id)
-        model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype=dtype).to(device)
+        self._tok = AutoTokenizer.from_pretrained(self.model_id)
+        self._model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype=dtype).to(self._device)
+
+    def _unload(self):
+        # Free the LLM immediately so Stable Diffusion has the memory.
+        self._model = None
+        self._tok = None
+        gc.collect()
+        clear_gpu_cache()
+
+    def _chat(self, messages: list, max_new_tokens: int = 320) -> str:
+        import torch
+        owns_model = getattr(self, "_model", None) is None
+        if owns_model:
+            self._load()
         try:
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}, *FEW_SHOT,
-                        {"role": "user", "content": description}]
+            tok, model = self._tok, self._model
             text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = tok(text, return_tensors="pt").to(device)
+            inputs = tok(text, return_tensors="pt").to(self._device)
             with torch.no_grad():
                 out = model.generate(
                     **inputs,
-                    max_new_tokens=320,
+                    max_new_tokens=max_new_tokens,
                     do_sample=False,          # deterministic: same description → same prompt
                     # Keep this mild: repetition_penalty / no_repeat_ngram_size also apply to the
                     # instructions + examples, which blocks the JSON keys and the user's own words.
@@ -166,10 +195,82 @@ class PromptEnhancer:
                 )
             return tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
         finally:
-            # Free the LLM immediately so Stable Diffusion has the memory.
-            del model
-            gc.collect()
-            clear_gpu_cache()
+            if owns_model:
+                self._unload()
+
+    def _generate(self, description: str, context: str = "") -> str:
+        user = description
+        if context:
+            user = (f"Keep these visuals identical in every scene: {context}\n"
+                    f"Scene to illustrate: {description}")
+        return self._chat([{"role": "system", "content": SYSTEM_PROMPT}, *FEW_SHOT,
+                           {"role": "user", "content": user}])
+
+    # ── Video planning (story vs presenter, recurring character) ──────────────
+
+    def describe_character(self, script: str, mode: str) -> str:
+        """Visual description of the story's main character, or of a fitting presenter."""
+        if mode == "presenter":
+            task = ("Describe the person who would present this script on camera: gender, age, "
+                    "ethnicity matching the script's language and names (Hindi/Hinglish or Indian names -> Indian), "
+                    "hair, clothing suited to the topic, expression.")
+            example_in = "Namaste dosto! Aaj hum seekhenge photosynthesis kya hota hai."
+            example_out = ("friendly Indian woman teacher in her late 20s, long black hair in a neat braid, "
+                           "light blue kurta, small earrings, warm smile")
+        else:
+            task = ("Describe how the main character of this story looks, so an illustrator can draw "
+                    "them the same way in every scene: species or person, age, size, colours, clothing, "
+                    "distinctive features. If there is no single main character, describe the main subject.")
+            example_in = "A little rabbit named Bunny lived near a big oak tree and loved carrots."
+            example_out = ("small white rabbit with long pink ears, big brown eyes, fluffy round tail, "
+                           "tiny blue scarf")
+        system = (task + " Reply with ONLY the description: 12-30 words, comma-separated, "
+                  "visual details only, no names, no actions, no background.")
+        raw = self._chat([
+            {"role": "system", "content": system},
+            {"role": "user", "content": example_in},
+            {"role": "assistant", "content": example_out},
+            {"role": "user", "content": script[:2000]},
+        ], max_new_tokens=80)
+        desc = raw.strip().strip('"').splitlines()[0] if raw.strip() else ""
+        return _clean_list(desc, max_items=15)
+
+    def plan_video(self, script: str, mode: str = "") -> dict:
+        """Return {"mode": "story"|"presenter", "style", "character", "setting"} for a script.
+
+        mode: force "story" or "presenter"; anything else lets the script decide.
+        """
+        forced = mode if mode in ("story", "presenter") else ""
+        raw = self._chat([{"role": "system", "content": PLAN_PROMPT}, *PLAN_FEW_SHOT,
+                          {"role": "user", "content": script[:2500]}], max_new_tokens=200)
+        data = _loose_json(raw, ("mode", "style", "character", "setting"))
+        mode = data.get("mode", "").strip().lower()
+        kw_mode = _mode_from_keywords(script, strict=True)
+        if forced:
+            mode = forced
+        elif kw_mode:                     # unambiguous wording beats the small model
+            mode = kw_mode
+        elif mode not in ("story", "presenter"):
+            mode = _mode_from_keywords(script)
+        style = _style_from_keywords(script) or data.get("style", "").strip().lower()
+        if style not in STYLES:
+            style = "photorealistic" if mode == "presenter" else "artistic"
+        character = _clean_list(data.get("character", ""), max_items=15)
+        if len(character.split()) < 5 or (forced and forced != data.get("mode", "").strip().lower()):
+            # Small models often leave this empty inside the JSON; a focused
+            # single-task call is far more reliable.
+            character = self.describe_character(script, mode)
+        character = _tidy_character(character)
+        if mode == "presenter" and _is_hindi(script) and "indian" not in character.lower():
+            character = f"Indian {character}" if character else "friendly Indian presenter"
+        plan = {
+            "mode": mode,
+            "style": style,
+            "character": character,
+            "setting": _clean_list(data.get("setting", ""), max_items=8),
+        }
+        logger.info(f"Video plan: {plan}")
+        return plan
 
     @staticmethod
     def _parse(raw: str) -> Optional[dict]:
@@ -195,6 +296,99 @@ class PromptEnhancer:
             "negative": str(data.get("negative", "")).strip(),
             "style": str(data.get("style", "")).strip().lower(),
         }
+
+
+PLAN_PROMPT = f"""You plan the visuals for a narrated video, given its script.
+
+Reply with ONLY a JSON object, keys in this order: {{"mode": "...", "style": "...", "character": "...", "setting": "..."}}
+
+mode:
+- "presenter" if one person speaks directly to the audience: greetings, "I"/"we"/"you", explaining a topic, a tutorial, news, an announcement, a lesson.
+- "story" if the script narrates events or a tale about characters, animals, places or history.
+
+character (15-30 words, visual only, comma-separated):
+- story: the main recurring character's look (species or person, age, colours, clothing, distinctive features). Empty string if there is no main character.
+- presenter: a fitting presenter for this script: gender, age, ethnicity matching the script's language/names/culture (Hindi or Indian names -> Indian), hair, clothing that suits the topic.
+
+setting (5-15 words): the main place or background.
+
+style: exactly one of {", ".join(STYLES)}. Kids stories and fables -> cartoon. Mythology, fantasy, history -> artistic. Anime -> anime. Presenter, news, real-world topics -> photorealistic.
+"""
+
+PLAN_FEW_SHOT = [
+    {"role": "user", "content": "Once upon a time a little rabbit named Bunny lived near a big oak tree. "
+                                "One morning she found a shiny golden key under a leaf."},
+    {"role": "assistant", "content": json.dumps({
+        "mode": "story", "style": "cartoon",
+        "character": "small white rabbit with long pink ears, big brown eyes, fluffy round tail, wearing a tiny blue scarf",
+        "setting": "sunny meadow beside a big oak tree, green grass, wildflowers"})},
+    {"role": "user", "content": "Namaste dosto! Aaj hum seekhenge ki photosynthesis kya hota hai "
+                                "aur plants apna khana kaise banate hain."},
+    {"role": "assistant", "content": json.dumps({
+        "mode": "presenter", "style": "photorealistic",
+        "character": "friendly Indian woman teacher in her late 20s, long black hair in a neat braid, "
+                     "light blue kurta, small earrings, warm smile",
+        "setting": "bright classroom with green chalkboard and plants"})},
+]
+
+
+def _loose_json(raw: str, keys) -> dict:
+    """Parse a JSON object from LLM output; salvage string fields if it's truncated."""
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            if isinstance(data, dict):
+                return {k: str(v) for k, v in data.items()}
+        except json.JSONDecodeError:
+            pass
+    data = {}
+    for key in keys:
+        m = re.search(rf'"{key}"\s*:\s*"([^"]*)', raw)
+        if m:
+            data[key] = m.group(1)
+    return data
+
+
+def _mode_from_keywords(script: str, strict: bool = False) -> str:
+    """Direct address ("hello", "you", "aap") → presenter; narration ("she", "once upon") → story.
+
+    strict=True returns "" unless one side is absent entirely (used to override the LLM).
+    """
+    s = script.lower()
+    direct = len(re.findall(r"\b(hello|hi|namaste|welcome|dosto|friends|today we|i am|i'm|my name|"
+                            r"you|your|let's|let us|subscribe|aap|hum|aaj)\b", s))
+    narrative = len(re.findall(r"\b(once upon|there was|there lived|he|she|they|his|her|their|"
+                               r"one day|long ago|story|in the year)\b", s))
+    if strict:
+        if direct == 0 and narrative > 0:
+            return "story"
+        if narrative == 0 and direct > 0:
+            return "presenter"
+        return ""
+    return "presenter" if direct > narrative else "story"
+
+
+def _tidy_character(desc: str) -> str:
+    """Keep a character description visual and short.
+
+    The small model sometimes returns a story summary ("Ramu lived in a village.
+    Every day he worked…") or bakes a plot object into the look ("golden pot in
+    hand"), which would then appear in every scene.
+    """
+    desc = desc.split(". ")[0]                     # first sentence only
+    desc = re.sub(r"\b(lived|lives|worked|works|was|were|went|found|named \w+)\b.*", "", desc,
+                  flags=re.IGNORECASE)             # drop narrative tails
+    items = [t for t in (x.strip() for x in desc.split(","))
+             if t and not re.search(r"\b(in hand|holding|carrying)\b", t, re.IGNORECASE)]
+    return ", ".join(items)[:220].strip(" ,")
+
+
+def _is_hindi(script: str) -> bool:
+    if re.search(r"[\u0900-\u097F]", script):   # Devanagari
+        return True
+    return len(re.findall(r"\b(hai|hain|aap|hum|mein|aaj|dosto|kaise|kya|yeh|nahi|karein)\b",
+                          script.lower())) >= 2
 
 
 DRAWN = {"cartoon", "anime", "artistic", "3d_render"}

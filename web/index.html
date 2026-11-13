@@ -445,13 +445,13 @@ video { width: 100%; display: block; background: #000; max-height: 360px; }
     <!-- ══ VIDEO MODE ══ -->
     <div class="mode-panel active" id="panel-video">
 
-      <div class="section-header"><span class="dot"></span> Character</div>
+      <div class="section-header"><span class="dot"></span> Character <span style="font-weight:400;opacity:0.6;text-transform:none;letter-spacing:0">(optional — leave empty and AI creates the visuals)</span></div>
       <div class="section-body">
         <div class="upload-zone" id="char-zone">
           <input type="file" id="char-input" accept="image/*" multiple onchange="onCharUpload(event)">
           <div id="char-placeholder">
             <div class="upload-icon">🧑</div>
-            <div class="upload-label">Upload portrait(s)<br><small>Select multiple · JPG · PNG · WEBP</small></div>
+            <div class="upload-label">Upload portrait(s) — or skip<br><small>No image? AI draws scenes from your script</small></div>
           </div>
         </div>
         <div class="char-grid" id="char-grid" style="display:none"></div>
@@ -486,8 +486,27 @@ video { width: 100%; display: block; background: #000; max-height: 360px; }
 
       <div class="divider"></div>
 
-      <div class="section-header"><span class="dot"></span> Voice (optional)</div>
+      <div class="section-header"><span class="dot"></span> Voice</div>
       <div class="section-body">
+        <div>
+          <label for="voice-select">AI voice</label>
+          <select id="voice-select"><option value="en-IN-NeerjaNeural">♀ Neerja – warm, friendly</option></select>
+        </div>
+        <div>
+          <label>Speed</label>
+          <div class="range-row">
+            <input type="range" id="voice-speed" min="-50" max="50" step="5" value="0"
+                   oninput="document.getElementById('speed-val').textContent=(this.value>0?'+':'')+this.value+'%'">
+            <span class="range-val" id="speed-val">0%</span>
+          </div>
+        </div>
+        <div class="enhance-row">
+          <button class="btn-mini" id="voice-preview-btn" onclick="generateVoice(true)">▶ Preview voice</button>
+          <button class="btn-mini" id="voice-full-btn" onclick="generateVoice(false)">🎧 Generate full voice-over</button>
+          <a class="btn-mini" id="voice-dl" style="display:none;text-decoration:none" download>⬇ Download</a>
+        </div>
+        <audio id="voice-audio" controls style="width:100%;display:none;margin-top:6px"></audio>
+        <div class="toggle-desc" style="margin-top:4px">Or clone a voice from a sample (overrides the AI voice):</div>
         <div class="upload-zone" id="voice-zone" style="min-height:66px">
           <input type="file" id="voice-input" accept="audio/*" onchange="onVoiceUpload(event)">
           <div class="upload-icon" style="font-size:18px">🎤</div>
@@ -499,6 +518,21 @@ video { width: 100%; display: block; background: #000; max-height: 360px; }
 
       <div class="section-header"><span class="dot"></span> Options</div>
       <div class="section-body">
+        <div id="ai-visual-opts">
+          <label for="video-mode">AI video type <span style="font-weight:400;opacity:0.6">(when no character image)</span></label>
+          <select id="video-mode">
+            <option value="auto" selected>Auto — decide from the script</option>
+            <option value="story">Story — a new scene image for each part</option>
+            <option value="presenter">Presenter — AI host + topic visuals</option>
+          </select>
+        </div>
+        <div>
+          <label for="video-format">Format</label>
+          <select id="video-format">
+            <option value="16:9" selected>16:9 landscape (YouTube)</option>
+            <option value="9:16">9:16 vertical (Reels / Shorts)</option>
+          </select>
+        </div>
         <div class="toggle-row">
           <div><div class="toggle-label">Full HD Enhancement</div><div class="toggle-desc">Real-ESRGAN + GFPGAN upscaling</div></div>
           <input type="checkbox" class="toggle" id="enhance-toggle" checked>
@@ -509,7 +543,7 @@ video { width: 100%; display: block; background: #000; max-height: 360px; }
         </div>
         <div class="toggle-row">
           <div><div class="toggle-label">Burn Subtitles</div><div class="toggle-desc">Embed captions in video</div></div>
-          <input type="checkbox" class="toggle" id="subs-toggle">
+          <input type="checkbox" class="toggle" id="subs-toggle" checked>
         </div>
       </div>
 
@@ -819,7 +853,63 @@ document.addEventListener('DOMContentLoaded', () => {
     const el = document.getElementById(id);
     if (el) updateRange(el, id === 'img-steps' ? 'steps-val' : 'guidance-val');
   });
+  loadVoices();
 });
+
+// ── AI voices (Edge-TTS) ───────────────────────────────────────
+async function loadVoices() {
+  const sel = document.getElementById('voice-select');
+  try {
+    const voices = await (await fetch('/voices')).json();
+    const keep = sel.value;
+    sel.innerHTML = '';
+    const groups = {};
+    voices.forEach(v => {
+      if (!groups[v.group]) {
+        groups[v.group] = document.createElement('optgroup');
+        groups[v.group].label = v.group;
+        sel.appendChild(groups[v.group]);
+      }
+      const o = document.createElement('option');
+      o.value = v.id;
+      o.textContent = (v.gender === 'female' ? '♀ ' : '♂ ') + v.label;
+      groups[v.group].appendChild(o);
+    });
+    sel.value = keep;
+  } catch (e) { logLine('Could not load voice list', 'error'); }
+}
+
+async function generateVoice(preview) {
+  const script = document.getElementById('script-input').value.trim();
+  if (!script) { showToast('Write a script first.', 'warn'); return; }
+  const btn = document.getElementById(preview ? 'voice-preview-btn' : 'voice-full-btn');
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = preview ? '▶ Generating…' : '🎧 Generating…';
+  try {
+    const form = new FormData();
+    form.append('script', script);
+    form.append('voice', document.getElementById('voice-select').value);
+    form.append('speed', document.getElementById('voice-speed').value);
+    form.append('preview', preview);
+    const r = await fetch('/voice', { method: 'POST', body: form });
+    if (!r.ok) {
+      let msg = await r.text();
+      try { msg = JSON.parse(msg).detail || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const url = URL.createObjectURL(await r.blob());
+    const audio = document.getElementById('voice-audio');
+    audio.src = url; audio.style.display = ''; audio.play().catch(() => {});
+    const dl = document.getElementById('voice-dl');
+    dl.href = url; dl.download = (preview ? 'voice_preview' : 'voice_over') + '.wav';
+    dl.style.display = '';
+  } catch (err) {
+    showToast(err.message, 'error');
+    logLine('Voice error: ' + err.message, 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
 
 // ── Video generation ───────────────────────────────────────────
 async function startVideoGeneration() {
@@ -830,17 +920,23 @@ async function startVideoGeneration() {
   const still     = document.getElementById('still-toggle').checked;
   const subtitles = document.getElementById('subs-toggle').checked;
 
-  if (!charFiles.length) { showToast('Upload a character image first.', 'warn'); return; }
   if (!script)           { showToast('Enter a script first.', 'warn'); return; }
 
   const form = new FormData();
   form.append('script', script); form.append('language', language);
   form.append('enhance', enhance); form.append('still_mode', still);
   form.append('subtitles', subtitles);
+  form.append('voice', document.getElementById('voice-select').value);
+  form.append('speed', document.getElementById('voice-speed').value);
+  form.append('mode', document.getElementById('video-mode').value);
+  form.append('video_format', document.getElementById('video-format').value);
+  if (!charFiles.length) logLine('No character image — AI will plan and draw the scenes', 'info');
 
   // Primary image first, then the rest
-  const ordered = [charFiles[primaryCharIdx], ...charFiles.filter((_,i) => i !== primaryCharIdx)];
-  ordered.forEach(f => form.append('characters', f));
+  if (charFiles.length) {
+    const ordered = [charFiles[primaryCharIdx], ...charFiles.filter((_,i) => i !== primaryCharIdx)];
+    ordered.forEach(f => form.append('characters', f));
+  }
 
   // Voice is optional — if missing, TTS falls back to silence
   if (voiceFile) form.append('voice_sample', voiceFile);

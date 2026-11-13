@@ -118,7 +118,7 @@ class ModelDownloader:
                 console.print(f"[yellow]Skipping Wav2Lip (requires manual download – see models/wav2lip/README.md)[/yellow]")
                 continue
             self._download_group(key, spec)
-        self._symlink_sadtalker_weights()
+        self._cleanup_legacy_gfpgan_dirs()
         console.print("\n[bold green]All models downloaded.[/bold green]")
 
     def download_group(self, group_name: str):
@@ -127,25 +127,24 @@ class ModelDownloader:
             return
         self._download_group(group_name, MODELS[group_name])
         if group_name == "gfpgan":
-            self._symlink_sadtalker_weights()
+            self._cleanup_legacy_gfpgan_dirs()
 
-    def _symlink_sadtalker_weights(self):
-        """Create symlinks in gfpgan/weights/ pointing to models/gfpgan/ so SadTalker can find them."""
-        weights_dir = self.root / "gfpgan" / "weights"
-        weights_dir.mkdir(parents=True, exist_ok=True)
-        links = [
-            "detection_Resnet50_Final.pth",
-            "parsing_parsenet.pth",
-        ]
-        for name in links:
-            src = self.root / "models" / "gfpgan" / name
-            dst = weights_dir / name
-            if not src.exists():
-                continue
-            if dst.exists() or dst.is_symlink():
-                continue
-            dst.symlink_to(src)
-            console.print(f"  [dim]↪ linked {name} → models/gfpgan/{name}[/dim]")
+    def _cleanup_legacy_gfpgan_dirs(self):
+        """Remove legacy gfpgan/weights symlink dirs; SadTalker now reads models/gfpgan/ directly.
+
+        A directory named gfpgan/ in the project root or in third_party/SadTalker
+        (SadTalker's cwd) shadows the installed gfpgan package:
+        "cannot import name 'GFPGANer' from 'gfpgan' (unknown location)".
+        patch_dependencies.py makes SadTalker read SADTALKER_FACEXLIB_DIR instead,
+        which face_animator points at models/gfpgan/.
+        """
+        import shutil
+        for legacy in (self.root / "gfpgan", self.root / "third_party" / "SadTalker" / "gfpgan"):
+            weights = legacy / "weights"
+            # Only remove dirs that hold nothing but our symlinks / re-downloadable weights
+            if weights.is_dir() and all(p.suffix == ".pth" for p in weights.iterdir()):
+                shutil.rmtree(legacy)
+                console.print(f"  [dim]removed legacy {legacy.relative_to(self.root)}/ (shadowed gfpgan package)[/dim]")
 
     def _download_group(self, name: str, spec: dict):
         console.print(f"[cyan]─── {spec['description']} ───[/cyan]")

@@ -66,8 +66,12 @@ def create_app(cfg: dict) -> FastAPI:
         enhance: bool = Form(default=True),
         still_mode: bool = Form(default=False),
         subtitles: bool = Form(default=False),
-        characters: List[UploadFile] = File(...),
+        characters: Optional[List[UploadFile]] = File(default=None),
         voice_sample: Optional[UploadFile] = File(default=None),
+        voice: str = Form(default="en-IN-NeerjaNeural"),
+        speed: int = Form(default=0),
+        mode: str = Form(default="auto"),          # no images: auto | story | presenter
+        video_format: str = Form(default="16:9"),  # no images: 16:9 | 9:16
     ):
         """Submit a video generation job. Returns job_id immediately."""
         job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -76,14 +80,27 @@ def create_app(cfg: dict) -> FastAPI:
 
         # Save all character images; first one is used for video generation
         char_paths = []
-        for i, char_file in enumerate(characters):
+        for i, char_file in enumerate(characters or []):
             if char_file and char_file.filename:
                 p = job_dir / f"character_{i}{Path(char_file.filename).suffix}"
                 p.write_bytes(await char_file.read())
                 char_paths.append(str(p))
 
+        if not script.strip():
+            raise HTTPException(400, "Script is empty")
+
         if not char_paths:
-            raise HTTPException(400, "At least one character image is required")
+            # No character image: AI plans scenes, draws them, narrates (modules/story_video.py)
+            jobs[job_id] = {"id": job_id, "status": "queued", "progress": 0,
+                            "message": "Queued", "output": None, "error": None}
+            background_tasks.add_task(
+                _run_story_generation, job_id=job_id, jobs=jobs, cfg=cfg, script=script,
+                job_dir=job_dir, voice=voice, rate=_edge_rate(speed), language=language,
+                fmt=video_format if video_format in ("16:9", "9:16") else "16:9",
+                subtitles=subtitles, mode=mode,
+            )
+            return JSONResponse({"job_id": job_id, "status": "queued"})
+
         char_path = char_paths[0]  # primary image for SadTalker
 
         voice_path = None
@@ -114,6 +131,8 @@ def create_app(cfg: dict) -> FastAPI:
             still_mode=still_mode,
             subtitles=subtitles,
             job_dir=job_dir,
+            voice=voice,
+            rate=_edge_rate(speed),
         )
 
         return JSONResponse({"job_id": job_id, "status": "queued"})
@@ -184,6 +203,59 @@ def create_app(cfg: dict) -> FastAPI:
             model_id=model_id, fast=fast,
         )
         return JSONResponse({"job_id": job_id, "status": "queued"})
+
+    @app.get("/voices")
+    async def list_voices():
+        """Curated AI voices for the Voice dropdown."""
+        from modules.tts_engine import VOICES
+        return JSONResponse([
+            {"id": v, "label": label, "gender": g, "group": grp} for v, label, g, grp in VOICES
+        ])
+
+    @app.post("/voice")
+    async def generate_voice(
+        script: str = Form(...),
+        voice: str = Form(default="en-IN-NeerjaNeural"),
+        speed: int = Form(default=0),
+        preview: bool = Form(default=False),
+    ):
+        """Turn a script into a voice-over WAV with the chosen AI voice.
+
+        preview=True speaks only the first ~2 sentences (quick listen in the UI).
+        Honors [PAUSE]/[BREAK] markers like the video pipeline does.
+        """
+        from modules.script_processor import ScriptProcessor
+        from modules.tts_engine import TTSEngine, EDGE_VOICE_RE
+
+        if not script.strip():
+            raise HTTPException(400, "Script is empty")
+        if not EDGE_VOICE_RE.match(voice):
+            raise HTTPException(400, f"Unknown voice: {voice}")
+
+        segments = ScriptProcessor(cfg).process(script)
+        if preview:
+            picked, chars = [], 0
+            for seg in segments:
+                picked.append(seg); chars += len(seg.text)
+                if chars >= 180:
+                    break
+            segments = picked
+
+        out_dir = ROOT / "outputs" / "audio"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        kind = "preview" if preview else "voice"
+        out = out_dir / f"{kind}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.wav"
+        tts = TTSEngine(cfg)
+        try:
+            await asyncio.to_thread(
+                tts.synthesize, segments, None, "en", voice, str(out), _edge_rate(speed)
+            )
+        except Exception as e:
+            raise HTTPException(502, f"Voice generation failed: {e}")
+        if getattr(tts, "failed_segments", 0) == len(segments):
+            out.unlink(missing_ok=True)
+            raise HTTPException(502, "Voice generation failed — Edge-TTS needs an internet connection.")
+        return FileResponse(str(out), media_type="audio/wav", filename=out.name)
 
     @app.post("/enhance-prompt")
     async def enhance_prompt(description: str = Form(...)):
@@ -271,7 +343,8 @@ def create_app(cfg: dict) -> FastAPI:
 
 async def _run_generation(
     job_id, jobs, cfg, script, char_path, char_paths,
-    voice_path, language, enhance, still_mode, subtitles, job_dir
+    voice_path, language, enhance, still_mode, subtitles, job_dir,
+    voice="default", rate="+0%",
 ):
     from utils.gpu_utils import get_device
     import time as _time
@@ -301,8 +374,8 @@ async def _run_generation(
         from modules.tts_engine import TTSEngine
         audio_path = await asyncio.to_thread(
             TTSEngine(cfg, device=device).synthesize,
-            segments, voice_path, language, "default",
-            str(job_dir / "audio.wav"),
+            segments, voice_path, language, voice,
+            str(job_dir / "audio.wav"), rate,
         )
 
         update(3, "Animating character…", 45)
@@ -450,14 +523,46 @@ _image_gen = None
 _image_gen_lock = threading.Lock()
 
 
-def _generate_image_locked(cfg, *args):
+def _get_image_gen(cfg):
     global _image_gen
+    if _image_gen is None:
+        from modules.image_generator import ImageGenerator
+        from utils.gpu_utils import get_device
+        _image_gen = ImageGenerator(cfg, device=get_device())
+    return _image_gen
+
+
+def _generate_image_locked(cfg, *args):
     with _image_gen_lock:
-        if _image_gen is None:
-            from modules.image_generator import ImageGenerator
-            from utils.gpu_utils import get_device
-            _image_gen = ImageGenerator(cfg, device=get_device())
-        return _image_gen.generate(*args)
+        return _get_image_gen(cfg).generate(*args)
+
+
+async def _run_story_generation(job_id, jobs, cfg, script, job_dir, voice, rate,
+                                language, fmt, subtitles, mode):
+    """Script-only video: scenes drawn by SD, narrated, animated (see story_video.py)."""
+    import time as _time
+    started = _time.time()
+
+    def progress(pct, msg):
+        jobs[job_id].update({"status": "running", "progress": pct, "message": msg,
+                             "step_started_at": _time.time(), "job_started_at": started})
+    try:
+        from modules.story_video import StoryVideoBuilder
+        builder = StoryVideoBuilder(cfg, _get_image_gen(cfg), _image_gen_lock)
+        out = await asyncio.to_thread(
+            builder.build, script, job_dir, voice, rate, language, fmt, subtitles,
+            None, mode, progress,
+        )
+        jobs[job_id].update({"status": "done", "progress": 100, "message": "Complete!", "output": out})
+    except Exception as e:
+        jobs[job_id].update({"status": "error", "error": str(e), "message": f"Error: {e}"})
+        import traceback; traceback.print_exc()
+
+
+def _edge_rate(speed: int) -> str:
+    """UI speed slider (-50..+50) → Edge-TTS rate string like '+10%'."""
+    speed = max(-50, min(50, int(speed)))
+    return f"{speed:+d}%"
 
 
 def _enhance_prompt_locked(cfg, description):
