@@ -118,6 +118,7 @@ class ModelDownloader:
                 console.print(f"[yellow]Skipping Wav2Lip (requires manual download – see models/wav2lip/README.md)[/yellow]")
                 continue
             self._download_group(key, spec)
+        self._symlink_sadtalker_weights()
         console.print("\n[bold green]All models downloaded.[/bold green]")
 
     def download_group(self, group_name: str):
@@ -125,6 +126,26 @@ class ModelDownloader:
             console.print(f"[red]Unknown model group: {group_name}[/red]")
             return
         self._download_group(group_name, MODELS[group_name])
+        if group_name == "gfpgan":
+            self._symlink_sadtalker_weights()
+
+    def _symlink_sadtalker_weights(self):
+        """Create symlinks in gfpgan/weights/ pointing to models/gfpgan/ so SadTalker can find them."""
+        weights_dir = self.root / "gfpgan" / "weights"
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        links = [
+            "detection_Resnet50_Final.pth",
+            "parsing_parsenet.pth",
+        ]
+        for name in links:
+            src = self.root / "models" / "gfpgan" / name
+            dst = weights_dir / name
+            if not src.exists():
+                continue
+            if dst.exists() or dst.is_symlink():
+                continue
+            dst.symlink_to(src)
+            console.print(f"  [dim]↪ linked {name} → models/gfpgan/{name}[/dim]")
 
     def _download_group(self, name: str, spec: dict):
         console.print(f"[cyan]─── {spec['description']} ───[/cyan]")
