@@ -13,7 +13,11 @@ Usage:
 import os
 import sys
 import json
+import warnings
 from pathlib import Path
+
+# librosa 0.9.x imports pkg_resources; we pin setuptools<81 so it keeps working.
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 from datetime import datetime
 
 import click

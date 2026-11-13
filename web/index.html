@@ -258,6 +258,11 @@ input[type="range"] {
   font-family: var(--sans);
 }
 .btn-generate.image-mode { background: linear-gradient(135deg, var(--accent2), #a78bfa); }
+.enhance-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.btn-mini { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius); padding: 6px 12px; font-size: 12px; cursor: pointer; }
+.btn-mini:hover { border-color: var(--accent2); }
+.btn-mini:disabled { opacity: 0.5; cursor: wait; }
+.enhanced-badge { font-size: 11px; color: var(--accent2); font-weight: 600; }
 .btn-generate:hover { opacity: 0.92; transform: translateY(-1px); }
 .btn-generate:active { transform: translateY(0); }
 .btn-generate:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
@@ -523,8 +528,16 @@ video { width: 100%; display: block; background: #000; max-height: 360px; }
       <div class="section-header"><span class="dot purple"></span> Prompt</div>
       <div class="section-body">
         <div>
-          <label for="img-prompt">Describe the image</label>
-          <textarea id="img-prompt" rows="5" placeholder="A professional portrait of a confident CEO in a modern office, natural window light, shallow depth of field…"></textarea>
+          <label for="img-prompt">Describe the image <span class="enhanced-badge" id="enhanced-badge" style="display:none">✨ enhanced</span></label>
+          <textarea id="img-prompt" rows="5" oninput="onPromptInput()" placeholder="Describe it in your own words — e.g. hanuman ji holding gada and lifting a mountain, flying in the sky"></textarea>
+          <div class="enhance-row">
+            <button class="btn-mini" id="enhance-btn" onclick="enhancePrompt()">✨ Enhance now</button>
+            <button class="btn-mini" id="enhance-undo" onclick="undoEnhance()" style="display:none">↶ Undo</button>
+          </div>
+        </div>
+        <div class="toggle-row">
+          <div><div class="toggle-label">✨ Auto-enhance my description</div><div class="toggle-desc">A local AI rewrites it into a detailed image prompt before generating (~10 s)</div></div>
+          <input type="checkbox" class="toggle" id="img-auto-enhance" checked>
         </div>
         <div>
           <label for="img-neg">Negative prompt <span style="font-weight:400;opacity:0.6">(what to avoid)</span></label>
@@ -544,17 +557,25 @@ video { width: 100%; display: block; background: #000; max-height: 360px; }
             <option value="portrait">Studio Portrait</option>
             <option value="artistic">Digital Art</option>
             <option value="anime">Anime</option>
+            <option value="cartoon">Cartoon (3D / Pixar-like)</option>
             <option value="3d_render">3D Render</option>
             <option value="none">None (prompt only)</option>
           </select>
         </div>
         <div>
           <label>Model</label>
-          <select id="img-model">
-            <option value="runwayml/stable-diffusion-v1-5">SD 1.5 – Fastest (~4 GB)</option>
-            <option value="stabilityai/stable-diffusion-2-1">SD 2.1 – Balanced (~5 GB)</option>
-            <option value="stabilityai/sdxl-turbo">SDXL Turbo – High Quality (~6 GB)</option>
+          <select id="img-model" onchange="onImageModelChange()">
+            <option value="Lykon/dreamshaper-8" selected>DreamShaper 8 – All-rounder: people, art, cartoon (~2 GB)</option>
+            <option value="SG161222/Realistic_Vision_V5.1_noVAE">Realistic Vision 5.1 – Photoreal people (~4.5 GB)</option>
+            <option value="gsdf/Counterfeit-V2.5">Counterfeit 2.5 – Anime / cartoon (~4 GB)</option>
+            <option value="runwayml/stable-diffusion-v1-5">SD 1.5 – Base model (~4 GB)</option>
+            <option value="stabilityai/stable-diffusion-2-1">SD 2.1 – Base model (~5 GB)</option>
+            <option value="stabilityai/sdxl-turbo">SDXL Turbo – needs 16 GB+ RAM (~6 GB)</option>
           </select>
+        </div>
+        <div class="toggle-row">
+          <div><div class="toggle-label">⚡ Fast mode</div><div class="toggle-desc">~6 steps instead of 30 (LCM). Great for trying prompts; slightly less detail.</div></div>
+          <input type="checkbox" class="toggle" id="img-fast">
         </div>
         <div>
           <label>Resolution</label>
@@ -562,6 +583,7 @@ video { width: 100%; display: block; background: #000; max-height: 360px; }
             <option value="512x512">512 × 512 (fastest)</option>
             <option value="768x768">768 × 768</option>
             <option value="512x768">512 × 768 (portrait)</option>
+            <option value="432x768">432 × 768 (9:16 – Reels / Shorts)</option>
             <option value="768x512">768 × 512 (landscape)</option>
             <option value="1024x1024">1024 × 1024 (SDXL only)</option>
           </select>
@@ -841,9 +863,104 @@ async function startVideoGeneration() {
 }
 
 // ── Image generation ───────────────────────────────────────────
+// Match the style preset to the model so prompts aren't fighting the checkpoint.
+function onImageModelChange() {
+  const model = document.getElementById('img-model').value;
+  const style = document.getElementById('img-style');
+  const photoStyles = ['photorealistic', 'cinematic', 'portrait'];
+  if (model === 'gsdf/Counterfeit-V2.5' && photoStyles.includes(style.value)) {
+    style.value = 'anime';
+  } else if (model === 'SG161222/Realistic_Vision_V5.1_noVAE' && !photoStyles.includes(style.value)) {
+    style.value = 'photorealistic';
+  }
+}
+
+// ── Prompt enhancement (plain description → SD prompt, local LLM) ──
+let promptEnhanced = false;
+let preEnhance = null;   // {prompt, neg, style, model} for Undo
+
+function setEnhancedState(on) {
+  promptEnhanced = on;
+  document.getElementById('enhanced-badge').style.display = on ? '' : 'none';
+  document.getElementById('enhance-undo').style.display = (on && preEnhance) ? '' : 'none';
+}
+
+function onPromptInput() {
+  // Clearing the box means a fresh description is coming
+  if (!document.getElementById('img-prompt').value.trim()) setEnhancedState(false);
+}
+
+function hasOption(sel, value) {
+  return [...sel.options].some(o => o.value === value);
+}
+
+// Pick a model that can actually draw the style the enhancer chose.
+function matchModelToStyle(style) {
+  const model = document.getElementById('img-model');
+  const photo = ['photorealistic', 'cinematic', 'portrait'];
+  if (style === 'anime') { model.value = 'gsdf/Counterfeit-V2.5'; return; }
+  if (model.value === 'SG161222/Realistic_Vision_V5.1_noVAE' && !photo.includes(style)) model.value = 'Lykon/dreamshaper-8';
+  if (model.value === 'gsdf/Counterfeit-V2.5' && style !== 'anime') model.value = 'Lykon/dreamshaper-8';
+}
+
+async function enhancePrompt() {
+  const box = document.getElementById('img-prompt');
+  const negBox = document.getElementById('img-neg');
+  const description = box.value.trim();
+  if (!description) { showToast('Describe the image first.', 'warn'); return false; }
+
+  const btn = document.getElementById('enhance-btn');
+  btn.disabled = true; btn.textContent = '✨ Enhancing…';
+  logLine('Enhancing prompt with local AI…', 'info');
+  try {
+    const form = new FormData();
+    form.append('description', description);
+    const r = await fetch('/enhance-prompt', { method: 'POST', body: form });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+
+    const style = document.getElementById('img-style');
+    const model = document.getElementById('img-model');
+    preEnhance = { prompt: box.value, neg: negBox.value, style: style.value, model: model.value };
+
+    box.value = data.prompt;
+    const userNeg = negBox.value.trim();
+    negBox.value = [userNeg, data.negative].filter(Boolean).join(', ');
+    if (data.style && hasOption(style, data.style)) {
+      style.value = data.style;
+      matchModelToStyle(data.style);
+    }
+    setEnhancedState(true);
+    logLine('Prompt enhanced (' + (data.style || 'style unchanged') + ')', 'ok');
+    return true;
+  } catch (err) {
+    logLine('Enhance failed: ' + err.message, 'error');
+    showToast('Prompt enhancement failed — using your text as-is.', 'warn');
+    return false;
+  } finally {
+    btn.disabled = false; btn.textContent = '✨ Enhance now';
+  }
+}
+
+function undoEnhance() {
+  if (!preEnhance) return;
+  document.getElementById('img-prompt').value = preEnhance.prompt;
+  document.getElementById('img-neg').value = preEnhance.neg;
+  document.getElementById('img-style').value = preEnhance.style;
+  document.getElementById('img-model').value = preEnhance.model;
+  preEnhance = null;
+  setEnhancedState(false);
+}
+
 async function startImageGeneration() {
+  if (!document.getElementById('img-prompt').value.trim()) { showToast('Enter a prompt first.', 'warn'); return; }
+  if (document.getElementById('img-auto-enhance').checked && !promptEnhanced) {
+    const genBtn = document.getElementById('image-gen-btn');
+    genBtn.disabled = true;
+    await enhancePrompt();
+    genBtn.disabled = false;
+  }
   const prompt = document.getElementById('img-prompt').value.trim();
-  if (!prompt) { showToast('Enter a prompt first.', 'warn'); return; }
 
   const neg     = document.getElementById('img-neg').value.trim();
   const style   = document.getElementById('img-style').value;
@@ -859,6 +976,7 @@ async function startImageGeneration() {
   form.append('width', res[0]); form.append('height', res[1]);
   form.append('steps', steps); form.append('guidance_scale', guidance);
   form.append('seed', seed);
+  form.append('fast', document.getElementById('img-fast').checked);
 
   setImageGenerating(true);
   showProgress(IMAGE_STEPS, true);
@@ -926,7 +1044,8 @@ function onImageDone(data) {
     logLine('Image ready!', 'ok');
     document.getElementById('img-meta').textContent =
       document.getElementById('img-res').value + ' · ' +
-      document.getElementById('img-steps').value + ' steps';
+      (document.getElementById('img-fast').checked ? 'fast mode'
+        : document.getElementById('img-steps').value + ' steps');
   } else {
     logLine('Error: ' + (data.error || 'Unknown'), 'error');
     setStatus('Failed');

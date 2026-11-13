@@ -26,6 +26,7 @@ STYLE_PRESETS = {
     "anime":          "anime artwork, anime style, key visual, vibrant, studio anime, highly detailed",
     "artistic":       "concept art, digital painting, artstation, illustration, sharp, highly detailed",
     "3d_render":      "3d render, octane render, highly detailed, volumetric lighting, 8k",
+    "cartoon":        "3d cartoon character, pixar style, cute, expressive, vibrant colors, smooth shading, soft lighting, highly detailed",
     "none":           "",
 }
 
@@ -35,6 +36,34 @@ NEGATIVE_BASE = (
     "watermark, signature, text, logo"
 )
 
+# Anime checkpoints respond to booru-style quality tags rather than photo terms.
+NEGATIVE_ANIME = (
+    "lowres, bad anatomy, bad hands, missing fingers, extra digits, worst quality, "
+    "low quality, jpeg artifacts, signature, watermark, text, blurry, nsfw"
+)
+
+SD_VAE_MSE = "stabilityai/sd-vae-ft-mse"          # sharper faces/eyes for SD 1.5 photo models
+LCM_LORA_SD15 = "latent-consistency/lcm-lora-sdv1-5"  # Fast mode: ~6 steps instead of 30
+
+# Per-model loading tweaks; models not listed load with defaults.
+#   variant: download the fp16 weights (half the size) when running in fp16
+#   vae:     replace the bundled VAE
+#   anime:   anime negatives, anime upscaler, no GFPGAN
+MODEL_PROFILES = {
+    "Lykon/dreamshaper-8":                  {"variant": "fp16"},
+    "SG161222/Realistic_Vision_V5.1_noVAE": {"vae": SD_VAE_MSE},
+    "gsdf/Counterfeit-V2.5":                {"anime": True},
+}
+
+# Styles where the subject is drawn/rendered, not photographed. GFPGAN would
+# paste a photographic face onto these, so face restoration is skipped.
+DRAWN_STYLES = {"anime", "artistic", "cartoon", "3d_render"}
+
+
+def _is_sd15_family(model_id: str) -> bool:
+    m = model_id.lower()
+    return not ("xl" in m or "turbo" in m or "stable-diffusion-2" in m)
+
 
 class ImageGenerator:
     def __init__(self, cfg: dict, device: str = "cpu"):
@@ -42,6 +71,10 @@ class ImageGenerator:
         self.device = device
         self._pipe = None
         self._current_model = None
+        self._default_scheduler = None
+        self._fast = False      # whether LCM-LoRA is currently loaded into _pipe
+        self._restorer = None   # GFPGAN, loaded lazily and reused
+        self._upsamplers = {}   # Real-ESRGAN by weights name, loaded lazily and reused
         self._pooled = None
         self._negative_pooled = None
 
@@ -57,19 +90,34 @@ class ImageGenerator:
         steps: int = 30,
         guidance_scale: float = 7.5,
         seed: Optional[int] = None,
-        model_id: str = "runwayml/stable-diffusion-v1-5",
+        model_id: str = "Lykon/dreamshaper-8",
         output_path: Optional[str] = None,
+        fast: bool = False,
     ) -> str:
         """Generate an image and return its file path."""
+        profile = MODEL_PROFILES.get(model_id, {})
+        is_anime = profile.get("anime", False)
+        is_drawn = is_anime or style in DRAWN_STYLES
 
         # Build full prompt with style prefix
         style_prefix = STYLE_PRESETS.get(style, "")
         full_prompt = f"{style_prefix}, {prompt}".strip(", ") if style_prefix else prompt
-        full_negative = f"{NEGATIVE_BASE}, {negative_prompt}".strip(", ") if negative_prompt else NEGATIVE_BASE
-
-        logger.info(f"Generating image: '{prompt[:60]}…' | {width}×{height} | {steps} steps")
+        neg_base = NEGATIVE_ANIME if is_anime else NEGATIVE_BASE
+        full_negative = f"{neg_base}, {negative_prompt}".strip(", ") if negative_prompt else neg_base
 
         pipe = self._load_pipeline(model_id)
+
+        # LCM-LoRA only exists for SD 1.5-family models
+        fast = fast and _is_sd15_family(model_id)
+        self._set_fast_mode(pipe, fast)
+        if fast:
+            steps = 6 if steps > 8 else max(4, steps)
+            guidance_scale = min(guidance_scale, 1.5)  # LCM needs low CFG
+
+        logger.info(
+            f"Generating image: '{prompt[:60]}…' | {width}×{height} | {steps} steps"
+            f"{' | fast' if fast else ''} | {model_id}"
+        )
 
         import torch
         generator = torch.Generator(device="cpu")
@@ -107,9 +155,10 @@ class ImageGenerator:
         result = pipe(**kwargs)
         image = result.images[0]
 
-        # Apply GFPGAN face restoration then Real-ESRGAN upscaling
-        image = self._restore_faces(image)
-        image = self._upscale(image)
+        # GFPGAN face restoration (photos only), then Real-ESRGAN upscaling
+        if not is_drawn:
+            image = self._restore_faces(image)
+        image = self._upscale(image, anime=is_drawn)
 
         # Save
         if output_path is None:
@@ -120,6 +169,10 @@ class ImageGenerator:
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         image.save(output_path)
+        # Return cached MPS/CUDA allocations to the OS; on an 8 GB Mac the
+        # allocator otherwise holds GBs between jobs and pushes the system into swap.
+        clear_gpu_cache()
+        gc.collect()
         logger.info(f"Image saved → {output_path}")
         return output_path
 
@@ -143,6 +196,18 @@ class ImageGenerator:
                 bg_upsampler=None,
                 device=self.device if self.device != "mps" else "cpu",
             )
+            # upscale=1: only restore faces here. Upscaling is Real-ESRGAN's job;
+            # doubling here too would hand it 4× the pixels to process.
+            if self._restorer is None:
+                self._restorer = GFPGANer(
+                    model_path=str(model_path),
+                    upscale=1,
+                    arch="clean",
+                    channel_multiplier=2,
+                    bg_upsampler=None,
+                    device=self.device if self.device != "mps" else "cpu",
+                )
+            restorer = self._restorer
 
             img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
             _, _, restored = restorer.enhance(img_bgr, has_aligned=False, only_center_face=False, paste_back=True)
@@ -153,8 +218,12 @@ class ImageGenerator:
             logger.warning(f"Face restoration skipped: {e}")
             return image
 
-    def _upscale(self, image):
-        """Run Real-ESRGAN 4× upscale on a PIL image. Returns original if unavailable."""
+    def _upscale(self, image, anime: bool = False):
+        """Run Real-ESRGAN 2× upscale on a PIL image. Returns original if unavailable.
+
+        anime=True uses the anime_6B weights, which keep flat colours and clean
+        line art instead of adding photographic texture.
+        """
         try:
             import numpy as np
             import cv2
@@ -162,22 +231,33 @@ class ImageGenerator:
             from basicsr.archs.rrdbnet_arch import RRDBNet
             from realesrgan import RealESRGANer
 
-            model_path = ROOT / "models" / "realesrgan" / "RealESRGAN_x4plus.pth"
+            weights = "RealESRGAN_x4plus_anime_6B" if anime else "RealESRGAN_x4plus"
+            model_path = ROOT / "models" / "realesrgan" / f"{weights}.pth"
             if not model_path.exists():
-                return image
+                if not anime:
+                    return image
+                weights = "RealESRGAN_x4plus"
+                model_path = ROOT / "models" / "realesrgan" / f"{weights}.pth"
+                if not model_path.exists():
+                    return image
 
-            dev = self.device if self.device != "mps" else "cpu"
-            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-            upsampler = RealESRGANer(
-                scale=4,
-                model_path=str(model_path),
-                model=model,
-                tile=512,
-                tile_pad=10,
-                pre_pad=0,
-                half=(dev != "cpu"),
-                device=dev,
-            )
+            # MPS works for RRDBNet (~11s for 512→1024 on M2 vs ~6 min on CPU).
+            # fp16 only on CUDA; on MPS use fp32 for reliable output.
+            if weights not in self._upsamplers:
+                import torch
+                num_block = 6 if weights.endswith("anime_6B") else 23
+                model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=num_block, num_grow_ch=32, scale=4)
+                self._upsamplers[weights] = RealESRGANer(
+                    scale=4,
+                    model_path=str(model_path),
+                    model=model,
+                    tile=512,
+                    tile_pad=10,
+                    pre_pad=0,
+                    half=("cuda" in self.device),
+                    device=torch.device(self.device),
+                )
+            upsampler = self._upsamplers[weights]
 
             img_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
             upscaled_bgr, _ = upsampler.enhance(img_bgr, outscale=2)
@@ -265,14 +345,30 @@ class ImageGenerator:
                 use_safetensors=True,
             )
         else:
+            profile = MODEL_PROFILES.get(model_id, {})
+            extra = {}
+            if profile.get("variant") and dtype == torch.float16:
+                extra["variant"] = profile["variant"]
+            if profile.get("vae"):
+                from diffusers import AutoencoderKL
+                extra["vae"] = AutoencoderKL.from_pretrained(profile["vae"], torch_dtype=dtype)
             pipe = StableDiffusionPipeline.from_pretrained(
                 model_id,
                 torch_dtype=dtype,
                 safety_checker=None,
+                feature_extractor=None,
                 requires_safety_checker=False,
+                **extra,
             )
-            # Faster scheduler
-            pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+            # DPM++ 2M Karras: good quality at 20–30 steps. Set algorithm_type
+            # explicitly — some checkpoints (DreamShaper) ship a DEIS config
+            # whose settings would otherwise carry over and fail.
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                pipe.scheduler.config,
+                algorithm_type="dpmsolver++",
+                solver_type="midpoint",
+                use_karras_sigmas=True,
+            )
 
         # Memory optimisations
         if self.device == "mps":
@@ -288,5 +384,28 @@ class ImageGenerator:
 
         self._pipe = pipe
         self._current_model = model_id
+        self._default_scheduler = pipe.scheduler
+        self._fast = False
         logger.info("Model loaded")
         return pipe
+
+    def _set_fast_mode(self, pipe, fast: bool):
+        """Load/unload LCM-LoRA and swap the scheduler to match."""
+        if fast == self._fast:
+            return
+        if fast:
+            from diffusers import LCMScheduler
+            logger.info("Enabling fast mode (LCM-LoRA)…")
+            try:
+                # weight_name is required when HF is offline / served from cache
+                pipe.load_lora_weights(
+                    LCM_LORA_SD15, weight_name="pytorch_lora_weights.safetensors", adapter_name="lcm"
+                )
+            except Exception:
+                pipe.unload_lora_weights()  # don't leave a half-loaded adapter behind
+                raise
+            pipe.scheduler = LCMScheduler.from_config(self._default_scheduler.config)
+        else:
+            pipe.unload_lora_weights()
+            pipe.scheduler = self._default_scheduler
+        self._fast = fast

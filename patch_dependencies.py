@@ -35,9 +35,19 @@ REPLACEMENTS = [
     # k[3] is shape (1,) and float(shape-(1,)-array) is a hard error in numpy 2.x.
     # Flatten k to 1D immediately so all indexing yields proper scalars.
     (
-        r'k, _, _, _ = np\.linalg\.lstsq\(A, b\)\n',
+        r'k, _, _, _ = np\.linalg\.lstsq\(A, b\)\n(?!\s*k = k\.ravel\(\))',
         'k, _, _, _ = np.linalg.lstsq(A, b)\n    k = k.ravel()  # (8,1) → (8,) so k[n] is scalar\n',
     ),
+    # GFPGAN downloads facexlib weights to a cwd-relative 'gfpgan/weights'. Run from
+    # the project root, that creates ./gfpgan/ which shadows the gfpgan package
+    # ("cannot import name 'GFPGANer' from 'gfpgan' (unknown location)").
+    # Anchor it to the GFPGAN repo dir instead.
+    (
+        r"model_rootpath='gfpgan/weights'\)",
+        "model_rootpath=os.path.join(ROOT_DIR, 'gfpgan/weights'))",
+    ),
+    # torchvision 0.13+ deprecated pretrained=False (facexlib retinaface); weights=None is identical
+    (r'models\.resnet50\(pretrained=False\)', 'models.resnet50(weights=None)'),
     # Also replace the old np.stack form if it survived a previous patch run
     (
         r't = np\.stack\(\[sTx, sTy\], axis=0\)',
@@ -54,6 +64,7 @@ PATCH_DIRS = [
 VENV_PATCH_FILES = [
     ROOT / 'venv/lib/python3.11/site-packages/basicsr/data/degradations.py',
     ROOT / 'venv/lib/python3.11/site-packages/skimage/util/dtype.py',
+    ROOT / 'venv/lib/python3.11/site-packages/facexlib/detection/retinaface.py',
 ]
 
 

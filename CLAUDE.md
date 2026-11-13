@@ -25,8 +25,10 @@ python agent.py generate -s scripts/example_script.txt -c characters/portrait.jp
 # Generate with voice cloning
 python agent.py generate -s scripts/my_script.txt -c characters/portrait.jpg -v voice_sample.wav
 
-# Download all model weights (run once after install)
+# Download all model weights (run once after install) — includes Image-mode SD models
 python setup_models.py --all
+# Image-mode models only (DreamShaper 8, Realistic Vision 5.1 + VAE, Counterfeit 2.5, LCM-LoRA, Qwen2.5-1.5B prompt enhancer; ~13 GB)
+python setup_models.py --image
 
 # Apply patches after any pip install/upgrade
 python patch_dependencies.py

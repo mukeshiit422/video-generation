@@ -8,6 +8,7 @@ import json
 import asyncio
 import tempfile
 import shutil
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -39,9 +40,9 @@ def create_app(cfg: dict) -> FastAPI:
     )
 
     # Serve web UI
-    web_dir = ROOT / "web"
-    if web_dir.exists():
-        app.mount("/static", StaticFiles(directory=str(web_dir / "static")), name="static")
+    static_dir = ROOT / "web" / "static"
+    if static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     # In-memory job tracker
     jobs: dict = {}
@@ -164,7 +165,8 @@ def create_app(cfg: dict) -> FastAPI:
         steps: int = Form(default=30),
         guidance_scale: float = Form(default=7.5),
         seed: int = Form(default=-1),
-        model_id: str = Form(default="runwayml/stable-diffusion-v1-5"),
+        model_id: str = Form(default="Lykon/dreamshaper-8"),
+        fast: bool = Form(default=False),
     ):
         """Submit a text-to-image job. Returns job_id immediately."""
         job_id = f"img_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
@@ -179,9 +181,24 @@ def create_app(cfg: dict) -> FastAPI:
             style=style, width=width, height=height,
             steps=steps, guidance_scale=guidance_scale,
             seed=None if seed == -1 else seed,
-            model_id=model_id,
+            model_id=model_id, fast=fast,
         )
         return JSONResponse({"job_id": job_id, "status": "queued"})
+
+    @app.post("/enhance-prompt")
+    async def enhance_prompt(description: str = Form(...)):
+        """Rewrite a plain description into an SD prompt with a local LLM.
+
+        Returns {"prompt", "negative", "style"}. Takes ~5–15 s (model loads,
+        runs, unloads); shares the image lock so it never overlaps SD on the GPU.
+        """
+        if not description.strip():
+            raise HTTPException(400, "Description is empty")
+        try:
+            return JSONResponse(await asyncio.to_thread(_enhance_prompt_locked, cfg, description))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            raise HTTPException(500, f"Prompt enhancement failed: {e}")
 
     @app.get("/jobs/{job_id}/image")
     async def download_image(job_id: str):
@@ -427,23 +444,38 @@ def _animate_multi_image(animator, char_paths, audio_path, job_dir, progress_cb)
         _P(a).unlink(missing_ok=True)
     _P(concat_list).unlink(missing_ok=True)
     return out
+# One generator per server process so the SD pipeline stays loaded between
+# requests; the lock serialises jobs so two don't fight over the GPU at once.
+_image_gen = None
+_image_gen_lock = threading.Lock()
+
+
+def _generate_image_locked(cfg, *args):
+    global _image_gen
+    with _image_gen_lock:
+        if _image_gen is None:
+            from modules.image_generator import ImageGenerator
+            from utils.gpu_utils import get_device
+            _image_gen = ImageGenerator(cfg, device=get_device())
+        return _image_gen.generate(*args)
+
+
+def _enhance_prompt_locked(cfg, description):
+    from modules.prompt_enhancer import PromptEnhancer
+    with _image_gen_lock:
+        return PromptEnhancer(cfg).enhance(description)
 
 
 async def _run_image_generation(
     job_id, jobs, cfg, prompt, negative_prompt,
-    style, width, height, steps, guidance_scale, seed, model_id
+    style, width, height, steps, guidance_scale, seed, model_id, fast=False
 ):
     try:
-        jobs[job_id].update({"status": "running", "progress": 20, "message": "Loading model…"})
-        from modules.image_generator import ImageGenerator
-        from utils.gpu_utils import get_device
-        gen = ImageGenerator(cfg, device=get_device())
-
-        jobs[job_id].update({"progress": 50, "message": "Generating image…"})
+        jobs[job_id].update({"status": "running", "progress": 50, "message": "Generating image…"})
         output_path = await asyncio.to_thread(
-            gen.generate,
+            _generate_image_locked, cfg,
             prompt, negative_prompt, style, width, height,
-            steps, guidance_scale, seed, model_id, None,
+            steps, guidance_scale, seed, model_id, None, fast,
         )
         jobs[job_id].update({
             "status": "done", "progress": 100,
